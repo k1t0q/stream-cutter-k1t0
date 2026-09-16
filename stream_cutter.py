@@ -1,4 +1,3 @@
-import sys
 import shutil
 import os, sys, re, json, time, math, wave, threading, subprocess
 from pathlib import Path
@@ -138,7 +137,7 @@ class ProgressAdapter:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("STREAM CUTTER k1t0 — v1.1.0 CLIENT EXE")
+        self.title("STREAM CUTTER k1t0 — v1.1.2 RANGE FETCH V2")
         self.geometry("1180x820"); self.minsize(1060,760); self.configure(bg="#0d0d12")
         self.meta=None; self.candidates=[]; self.build()
         self.after(250, lambda: install_clipboard_shortcuts(self))
@@ -463,212 +462,60 @@ class App(ctk.CTk):
                         ffexe=str(Path(ffdir)/"ffmpeg.exe")
                         if not Path(ffexe).exists(): ffexe="ffmpeg"
 
-                        # FAST FETCH: yt-dlp only resolves a direct audio stream URL.
-                        # FFmpeg then seeks the remote stream and saves only the requested window.
-                        self.info.set("FAST FETCH 1/2: получаю прямой аудиопоток YouTube…")
-                        self.pb["value"]=12
-                        q=run([YTDLP,"--no-playlist","-f","bestaudio[ext=m4a]/bestaudio",
-                               "-g",self.url.get().strip()],120)
-                        direct=""
-                        if q.returncode==0:
-                            direct=next((x.strip() for x in q.stdout.splitlines()
-                                         if x.strip().startswith(("http://","https://"))),"")
-                        if not direct:
-                            raise RuntimeError("Не удалось получить прямой аудиопоток YouTube.\n"+
-                                               (q.stderr or q.stdout or "")[-2500:])
-
-                        self.info.set(f"FAST FETCH 2/2: беру только {mins} мин с {hms(start_sec)}…")
+                        # RANGE FETCH V2: let yt-dlp + ffmpeg request the selected window as ONE job.
+                        # No manual 5-minute chunks, no parallel Googlevideo connections and no retry loop.
+                        self.info.set(f"Получаю аудио выбранного отрезка • {hms(start_sec)}–{hms(end_sec)}…")
                         self.pb["value"]=18
-                        # Put -ss before -i so FFmpeg performs input seeking instead of decoding from 00:00.
-                        # Mono 48 kbps is plenty for Whisper and keeps the cache tiny.
-                        # PARALLEL SEGMENTS:
-                        # YouTube throttles one audio read to ~2x on some VODs.
-                        # Split the requested window into independent 5-minute jobs and fetch them concurrently.
-                        chunk_sec=300
-                        jobs=[]
-                        segdir=WORK/f"segments_{start_sec}_{end_sec}"
-                        segdir.mkdir(parents=True,exist_ok=True)
-                        for idx,rel in enumerate(range(0,mins*60,chunk_sec)):
-                            dur=min(chunk_sec,mins*60-rel)
-                            seg=segdir/f"seg_{idx:03d}.m4a"
-                            if seg.exists() and seg.stat().st_size>64*1024:
-                                jobs.append({"idx":idx,"rel":rel,"dur":dur,"path":seg,"proc":None,
-                                             "done":True,"media":dur,"size":seg.stat().st_size})
-                                continue
-                            cmd=[ffexe,"-hide_banner","-loglevel","error","-nostats","-y",
-                                 "-ss",str(start_sec+rel),"-i",direct,"-t",str(dur),
-                                 "-vn","-ac","1","-ar","16000","-c:a","aac","-b:a","48k",
-                                 "-progress","pipe:1",str(seg)]
-                            flags=subprocess.CREATE_NO_WINDOW if os.name=="nt" else 0
-                            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                                                  text=True,encoding="utf-8",errors="replace",
-                                                  bufsize=1,creationflags=flags)
-                            job={"idx":idx,"rel":rel,"dur":dur,"path":seg,"proc":proc,
-                                 "done":False,"media":0.0,"size":0}
-                            jobs.append(job)
 
-                        import queue
-                        events=queue.Queue()
-                        def seg_reader(job):
-                            try:
-                                for line in job["proc"].stdout:
-                                    line=line.rstrip()
-                                    if "=" in line:
-                                        k,v=line.split("=",1)
-                                        events.put((job["idx"],k,v))
-                            finally:
-                                events.put((job["idx"],"__EOF__",""))
-                        for j in jobs:
-                            if j["proc"] is not None:
-                                threading.Thread(target=seg_reader,args=(j,),daemon=True).start()
+                        temp_base=WORK/f"range_audio_{start_sec}_{end_sec}"
+                        for old in WORK.glob(temp_base.name+".*"):
+                            try: old.unlink()
+                            except: pass
 
-                        fetch_started=time.time()
-                        byidx={j["idx"]:j for j in jobs}
-                        while True:
-                            try:
-                                while True:
-                                    idx,k,v=events.get_nowait()
-                                    j=byidx[idx]
-                                    if k in ("out_time_us","out_time_ms"):
-                                        try: j["media"]=min(j["dur"],int(v)/1000000.0)
-                                        except: pass
-                                    elif k=="total_size":
-                                        try: j["size"]=int(v)
-                                        except: pass
-                                    elif k=="__EOF__":
-                                        if j["proc"] is not None:
-                                            rc=j["proc"].poll()
-                                            if rc is not None:
-                                                j["done"]=(rc==0 and j["path"].exists() and j["path"].stat().st_size>64*1024)
-                            except queue.Empty:
-                                pass
+                        section=f"*{hms(start_sec)}-{hms(end_sec)}"
+                        cmd=[YTDLP,"--no-playlist","--no-warnings",
+                             "--socket-timeout","30","--retries","5","--fragment-retries","5",
+                             "-f","bestaudio[ext=m4a]/bestaudio",
+                             "--download-sections",section,
+                             "--force-keyframes-at-cuts",
+                             "--newline","--progress",
+                             "-o",str(temp_base)+".%(ext)s",self.url.get().strip()]
+                        flags=subprocess.CREATE_NO_WINDOW if os.name=="nt" else 0
+                        proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                                              text=True,encoding="utf-8",errors="replace",
+                                              bufsize=1,creationflags=flags)
+                        last=[]
+                        for line in proc.stdout:
+                            line=line.strip()
+                            if line:
+                                last.append(line)
+                                last=last[-25:]
+                            m=re.search(r"\[download\]\s+([0-9.]+)%",line)
+                            if m:
+                                try:
+                                    dp=max(0.0,min(100.0,float(m.group(1))))
+                                    self.pb["value"]=18+0.10*dp
+                                    self.info.set(f"Получаю аудио выбранного отрезка • {dp:.0f}%")
+                                    self.update_idletasks()
+                                except: pass
+                        rc=proc.wait()
+                        downloaded=[x for x in WORK.glob(temp_base.name+".*")
+                                    if x.is_file() and x.stat().st_size>64*1024]
+                        if rc!=0 or not downloaded:
+                            raise RuntimeError("YouTube не отдал выбранный аудио-отрезок.\n"+"\n".join(last[-12:]))
 
-                            # Refresh completion state.
-                            for j in jobs:
-                                if j["proc"] is not None and j["proc"].poll() is not None:
-                                    if j["proc"].returncode==0 and j["path"].exists() and j["path"].stat().st_size>64*1024:
-                                        j["done"]=True; j["media"]=j["dur"]; j["size"]=j["path"].stat().st_size
-
-                            total_media=sum(j["media"] for j in jobs)
-                            total_dur=sum(j["dur"] for j in jobs)
-                            pct=min(100.0,100*total_media/max(1,total_dur))
-                            size_mb=sum((j["path"].stat().st_size if j["path"].exists() else j["size"]) for j in jobs)/1024/1024
-                            complete=sum(1 for j in jobs if j["done"])
-                            elapsed=time.time()-fetch_started
-                            self.pb["value"]=18+0.10*pct
-                            self.info.set(
-                                f"Получаю аудио • {complete}/{len(jobs)} частей • {pct:.0f}% • "
-                                f"{size_mb:.1f} MB • {hms(elapsed)}")
-                            self.update_idletasks()
-
-                            if complete==len(jobs):
-                                break
-                            failed=[j for j in jobs if j["proc"] is not None and j["proc"].poll() is not None and not j["done"]]
-                            if failed:
-                                # A single YouTube/CDN connection can die while the other parallel
-                                # chunks finish normally. Do not throw away the whole analysis.
-                                # Stop only unfinished workers and recover missing chunks one by one,
-                                # obtaining a fresh signed media URL for every retry.
-                                pending=[j for j in jobs if not j["done"]]
-                                for j in pending:
-                                    if j["proc"] is not None and j["proc"].poll() is None:
-                                        try: j["proc"].kill()
-                                        except: pass
-
-                                self.info.set("Соединение с YouTube прервалось • восстанавливаю недостающие части…")
-                                self.update_idletasks()
-
-                                recovery_failed=[]
-                                for n,j in enumerate(pending,1):
-                                    ok=False
-                                    try:
-                                        if j["path"].exists(): j["path"].unlink()
-                                    except: pass
-
-                                    for attempt in range(1,5):
-                                        self.info.set(
-                                            f"Повторное подключение • часть {j['idx']+1}/{len(jobs)} • "
-                                            f"попытка {attempt}/4")
-                                        self.update_idletasks()
-
-                                        # Fresh direct URL: signed Googlevideo URLs may expire or a
-                                        # particular CDN connection may be reset during parallel fetch.
-                                        fresh=run([YTDLP,"--no-playlist","--socket-timeout","25",
-                                                   "--retries","3","-f",
-                                                   "bestaudio[ext=m4a]/bestaudio",
-                                                   "-g",self.url.get().strip()],25)
-                                        fresh_url=""
-                                        if fresh.returncode==0:
-                                            fresh_url=next((x.strip() for x in fresh.stdout.splitlines()
-                                                            if x.strip().startswith(("http://","https://"))),"")
-                                        if not fresh_url:
-                                            time.sleep(1.0)
-                                            continue
-
-                                        rr=run([ffexe,"-hide_banner","-loglevel","error","-y",
-                                                "-rw_timeout","30000000",
-                                                "-ss",str(start_sec+j["rel"]),"-i",fresh_url,
-                                                "-t",str(j["dur"]),"-vn","-ac","1","-ar","16000",
-                                                "-c:a","aac","-b:a","48k",str(j["path"])],
-                                               min(180,max(75,int(j["dur"]*0.75))))
-                                        if (rr.returncode==0 and j["path"].exists()
-                                                and j["path"].stat().st_size>64*1024):
-                                            j["done"]=True
-                                            j["media"]=j["dur"]
-                                            j["size"]=j["path"].stat().st_size
-                                            ok=True
-                                            break
-                                        time.sleep(1.5)
-
-                                    if not ok:
-                                        # Final fallback: let yt-dlp handle the section itself.
-                                        self.info.set(f"Резервное получение • часть {j['idx']+1}/{len(jobs)}")
-                                        self.update_idletasks()
-                                        sec_a=hms(start_sec+j["rel"])
-                                        sec_b=hms(start_sec+j["rel"]+j["dur"])
-                                        fallback=run([YTDLP,"--no-playlist","--socket-timeout","25",
-                                                      "--retries","3","--fragment-retries","3",
-                                                      "-f","bestaudio[ext=m4a]/bestaudio",
-                                                      "--download-sections",f"*{sec_a}-{sec_b}",
-                                                      "-o",str(j["path"]),self.url.get().strip()],240)
-                                        if j["path"].exists() and j["path"].stat().st_size>64*1024:
-                                            j["done"]=True
-                                            j["media"]=j["dur"]
-                                            j["size"]=j["path"].stat().st_size
-                                            ok=True
-                                        if not ok:
-                                            recovery_failed.append(j)
-
-                                if recovery_failed:
-                                    raise RuntimeError(
-                                        "YouTube не отдал часть аудио после 4 повторных попыток: "+
-                                        ", ".join(str(j["idx"]+1) for j in recovery_failed)+
-                                        ". Уже загруженные части сохранены — повторный запуск продолжит с кэша.")
-                                # Recovery succeeded; continue the outer loop and it will
-                                # immediately see all chunks as complete.
-                            if elapsed>420:
-                                for j in jobs:
-                                    if j["proc"] is not None and j["proc"].poll() is None: j["proc"].kill()
-                                raise RuntimeError("SEGMENT FETCH остановлен: превышен лимит 7 минут.")
-                            time.sleep(0.15)
-
-                        # Concatenate completed analysis-audio segments without re-downloading.
-                        concatfile=segdir/"concat.txt"
-                        # IMPORTANT: rebuild concat.txt every run using CURRENT folder paths.
-                        # This makes copied work caches portable between version folders.
-                        concat_lines=[]
-                        for j in jobs:
-                            current_path=j["path"].resolve().as_posix()
-                            concat_lines.append("file '" + current_path.replace("'", "'\\\\''") + "'")
-                        concatfile.write_text("\n".join(concat_lines)+"\n",encoding="utf-8")
-                        rr=run([ffexe,"-hide_banner","-loglevel","error","-y",
-                                "-f","concat","-safe","0","-i",str(concatfile.resolve()),
-                                "-c","copy",str(audio.resolve())],120)
-                        if rr.returncode or not audio.exists() or audio.stat().st_size<256*1024:
-                            raise RuntimeError("Не удалось склеить аудио-сегменты.\\n"+
+                        src_audio=max(downloaded,key=lambda x:x.stat().st_size)
+                        # Normalize to tiny mono 16 kHz AAC for Whisper/ACTION ENGINE.
+                        rr=run([ffexe,"-hide_banner","-loglevel","error","-y","-i",str(src_audio),
+                                "-vn","-ac","1","-ar","16000","-c:a","aac","-b:a","48k",str(audio)],180)
+                        if rr.returncode or not audio.exists() or audio.stat().st_size<128*1024:
+                            raise RuntimeError("Не удалось подготовить аудио для анализа.\n"+
                                                (rr.stderr or rr.stdout or "")[-2500:])
+                        if src_audio != audio:
+                            try: src_audio.unlink()
+                            except: pass
                         mb=audio.stat().st_size/1024/1024
-                        self.info.set(f"✓ FAST FETCH готов: {mins} мин • {mb:.1f} MB → запускаю Whisper")
+                        self.info.set(f"✓ RANGE FETCH готов: {mins} мин • {mb:.1f} MB → запускаю Whisper")
                         self.pb["value"]=28
                 else:
                     cached=sorted(WORK.glob("vod_audio.*"))
