@@ -17,22 +17,9 @@ jobs:
         with:
           python-version: "3.11"
           architecture: "x64"
-      - name: Patch client startup/progress adapter
+      - name: Apply client build fixes
         shell: pwsh
-        run: |
-          $p = 'stream_cutter.py'
-          $s = Get-Content $p -Raw -Encoding UTF8
-          $old = "    def __init__(self, bar):`r`n        self.bar=bar"
-          $new = "    def __init__(self, bar, owner=None):`r`n        self.bar=bar`r`n        self.widget=bar`r`n        self.owner=owner"
-          if (-not $s.Contains($old)) {
-            $old = "    def __init__(self, bar):`n        self.bar=bar"
-            $new = "    def __init__(self, bar, owner=None):`n        self.bar=bar`n        self.widget=bar`n        self.owner=owner"
-          }
-          if (-not $s.Contains($old)) { throw 'ProgressAdapter signature not found' }
-          $s = $s.Replace($old,$new)
-          $s = $s.Replace('progress_pct','progress_text')
-          Set-Content $p $s -Encoding UTF8
-          python -m py_compile stream_cutter.py
+        run: python patch_client_build.py
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -66,8 +53,7 @@ jobs:
           if (!(Test-Path "dist/STREAM CUTTER k1t0/runtime/ffmpeg.exe")) { throw "ffmpeg missing" }
       - name: ZIP client build
         shell: pwsh
-        run: |
-          Compress-Archive -Path "dist/STREAM CUTTER k1t0/*" -DestinationPath "STREAM_CUTTER_k1t0_CLIENT_WINDOWS.zip" -CompressionLevel Optimal
+        run: Compress-Archive -Path "dist/STREAM CUTTER k1t0/*" -DestinationPath "STREAM_CUTTER_k1t0_CLIENT_WINDOWS.zip" -CompressionLevel Optimal
       - name: Upload client build
         uses: actions/upload-artifact@v4
         with:
